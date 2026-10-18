@@ -1,0 +1,9 @@
+
+use_default_settings: true
+server:
+  secret_key: "replace-this-with-a-long-random-string"
+  limiter: false
+search:
+  formats:
+    - html
+    - json
