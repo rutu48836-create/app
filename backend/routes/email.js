@@ -12,10 +12,25 @@ import {
 
 const router = express.Router();
 
+const APP_REDIRECT_URL = process.env.APP_REDIRECT_URL || "myapp://email/callback";
+
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 
 const page = (message) =>
   `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Gmail</title></head><body style="font-family:sans-serif;padding:32px"><p>${esc(message)}</p></body></html>`;
+
+const backToApp = (res, status, params = {}) => {
+  const query = new URLSearchParams({ status, ...params }).toString();
+  const target = `${APP_REDIRECT_URL}${APP_REDIRECT_URL.includes("?") ? "&" : "?"}${query}`;
+  const safe = esc(target);
+  const jsTarget = JSON.stringify(target).replace(/</g, "\\u003c");
+
+  return res
+    .status(200)
+    .send(
+      `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="0;url=${safe}"><title>Gmail</title></head><body style="font-family:sans-serif;padding:32px"><p>Returning to the app...</p><p><a href="${safe}">Tap here if nothing happens</a></p><script>window.location.replace(${jsTarget});</script></body></html>`
+    );
+};
 
 router.get("/email/status", async (req, res) => {
   const { user_id } = req.query;
@@ -53,15 +68,15 @@ router.get("/email/callback", async (req, res) => {
   const userId = verifyState(state);
 
   if (error || !code || !userId) {
-    return res.status(400).send(page("Could not connect Gmail. Close this tab and try again."));
+    return backToApp(res, "error", { reason: error ? "denied" : "invalid_request" });
   }
 
   try {
     const email = await saveConnection(code, userId);
-    return res.send(page(`Connected ${email || "Gmail"}. You can close this tab and go back to the app.`));
+    return backToApp(res, "success", email ? { email } : {});
   } catch (e) {
     console.log(e);
-    return res.status(500).send(page(`Could not connect Gmail: ${e.message}`));
+    return backToApp(res, "error", { reason: "connect_failed" });
   }
 });
 
