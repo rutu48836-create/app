@@ -40,7 +40,7 @@ def register_failure():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "paused": time.time() < state["blocked_until"]}
+    return {"ok": True}
 
 
 @app.get("/search")
