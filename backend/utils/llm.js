@@ -6,11 +6,16 @@ import { WATCH_TOOLS, WATCH_NAMES, WATCH_NOTE, runWatchTool } from "./watcherToo
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
-const MAX_RESULT = 4000;
+const GROQ_MAX_OUT = Number(process.env.GROQ_MAX_OUT) || 2000;
+const MAX_RESULT = 3000;
 const MAX_SOURCES = 6;
 const MAX_FOLDER_ROUNDS = 5;
 const MAX_OUTPUT = 12000;
 const MAX_FILE_LIST = 200;
+const MAX_HISTORY = 10;
+const MAX_HISTORY_CHARS = 2000;
+const AGED_SEARCH = 900;
+const AGED_OTHER = 350;
 const EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
 const PHONE_RE = /(?:\+91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}/g;
 const LIMIT_REPLY =
@@ -172,8 +177,8 @@ async function pickTools(botType, userId) {
   }
 
   if (botType === "watcher") {
-  return { tools: [SEARCH_TOOL, READ_TOOL, ...WATCH_TOOLS], extra: RESEARCH_SAFETY + WATCH_NOTE, steps: 6 };
-}
+    return { tools: [SEARCH_TOOL, READ_TOOL, ...WATCH_TOOLS], extra: RESEARCH_SAFETY + WATCH_NOTE, steps: 6 };
+  }
 
   if (botType === "sales") {
     const conn = await getConnection(userId);
@@ -316,10 +321,10 @@ async function runTool(ctx, name, args) {
     else if (name === "send_email") result = await createDraft(ctx.userId, ctx.botId, args);
     else if (name === "web_search") {
       const res = await searchWeb(args.query, args.max_results);
-      const items = res.results.slice(0, 8).map((x) => ({
-        title: x.title,
+      const items = res.results.slice(0, 6).map((x) => ({
+        title: String(x.title || "").slice(0, 100),
         url: x.url,
-        snippet: String(x.snippet || "").slice(0, 200),
+        snippet: String(x.snippet || "").slice(0, 160),
         source: x.source,
       }));
 
@@ -344,14 +349,16 @@ async function runTool(ctx, name, args) {
       try {
         const host = new URL(page.url).hostname.replace("www.", "");
         const prev = ctx.leadFacts.get(host) || { emails: [], phones: [] };
-        emails = [...new Set([...prev.emails, ...(text.match(EMAIL_RE) || []).map((e) => e.toLowerCase())])]
+        const foundEmails = [...(text.match(EMAIL_RE) || []), ...(page.emails || [])].map((e) => e.toLowerCase());
+        const foundPhones = [...(text.match(PHONE_RE) || []), ...(page.phones || [])].map((n) => n.trim());
+        emails = [...new Set([...prev.emails, ...foundEmails])]
           .filter((e) => !/\.(png|jpe?g|gif|svg|webp)$/i.test(e))
           .slice(0, 5);
-        phones = [...new Set([...prev.phones, ...(text.match(PHONE_RE) || []).map((n) => n.trim())])].slice(0, 3);
+        phones = [...new Set([...prev.phones, ...foundPhones])].slice(0, 3);
         ctx.leadFacts.set(host, { emails, phones });
       } catch {}
 
-      result = { url: page.url, title: page.title, text: text.slice(0, 3000), emails, phones };
+      result = { url: page.url, title: page.title, text: text.slice(0, 2000), emails, phones };
     } else if (name === "save_lead") {
       const domain = String(args.domain || "").toLowerCase().replace("www.", "").slice(0, 200);
       const facts = ctx.leadFacts.get(domain);
@@ -383,10 +390,7 @@ async function runTool(ctx, name, args) {
           result = { saved: true };
         }
       }
-    }
-    
-    else if (WATCH_NAMES.has(name)) result = await runWatchTool(ctx.userId, name, args);
-    
+    } else if (WATCH_NAMES.has(name)) result = await runWatchTool(ctx.userId, name, args);
     else result = { error: "Unknown tool" };
 
     return JSON.stringify(result).slice(0, MAX_RESULT);
@@ -394,6 +398,25 @@ async function runTool(ctx, name, args) {
     console.log("tool error:", name, e.message);
     return JSON.stringify({ error: e.message });
   }
+}
+
+function retryDelay(r, j) {
+  const msg = String(j?.error?.message || "");
+  const m = msg.match(/try again in\s+([0-9hms.]+)/i);
+  if (m) {
+    const t = m[1];
+    const min = t.match(/(\d+(?:\.\d+)?)m(?!s)/);
+    const sec = t.match(/(\d+(?:\.\d+)?)s/);
+    const milli = t.match(/(\d+(?:\.\d+)?)ms/);
+    const ms =
+      (min ? parseFloat(min[1]) * 60000 : 0) +
+      (sec ? parseFloat(sec[1]) * 1000 : 0) +
+      (milli ? parseFloat(milli[1]) : 0);
+    if (ms > 0) return Math.min(ms + 300, 20000);
+  }
+  const header = Number(r.headers.get("retry-after"));
+  if (header > 0) return Math.min(header * 1000 + 300, 20000);
+  return 4000;
 }
 
 async function groqPost(apiKey, body) {
@@ -407,44 +430,84 @@ async function groqPost(apiKey, body) {
 
     if (r.status !== 429 || attempt === 2) return { r, j };
 
-    const wait = Math.min((Number(r.headers.get("retry-after")) || 12) * 1000 + 500, 20000);
+    const wait = retryDelay(r, j);
     console.log(`groq rate limited, waiting ${wait}ms`);
     await new Promise((res) => setTimeout(res, wait));
   }
 }
 
-function groqBody(messages, tools) {
+function groqBody(messages, tools, maxOut) {
   const body = { model: GROQ_MODEL, messages };
   if (GROQ_MODEL.startsWith("openai/gpt-oss")) body.reasoning_effort = "low";
+  if (maxOut) body.max_completion_tokens = maxOut;
   if (tools.length) body.tools = tools.map((t) => ({ type: "function", function: t }));
   return body;
 }
 
 const toolFailed = (r, j) => !r.ok && j?.error?.code === "tool_use_failed";
 
+function trimHistory(history) {
+  return (Array.isArray(history) ? history : []).slice(-MAX_HISTORY).map((m) => ({
+    ...m,
+    content: String(m.content ?? "").slice(0, MAX_HISTORY_CHARS),
+  }));
+}
+
+function ageToolResults(messages, names) {
+  let lastAssistant = -1;
+  for (let k = messages.length - 1; k >= 0; k--) {
+    if (messages[k].role === "assistant" && messages[k].tool_calls?.length) {
+      lastAssistant = k;
+      break;
+    }
+  }
+  if (lastAssistant < 0) return messages;
+
+  return messages.map((m, k) => {
+    if (m.role !== "tool" || k > lastAssistant) return m;
+    const limit = names.get(m.tool_call_id) === "web_search" ? AGED_SEARCH : AGED_OTHER;
+    const content = String(m.content ?? "");
+    if (content.length <= limit) return m;
+    return { ...m, content: content.slice(0, limit) };
+  });
+}
+
 async function callGroq({ apiKey, system, history, ctx, tools, steps, rounds }) {
   const messages = [
     { role: "system", content: system },
-    ...history.map((m) => ({ role: m.role === "ai" ? "assistant" : "user", content: m.content })),
+    ...trimHistory(history).map((m) => ({ role: m.role === "ai" ? "assistant" : "user", content: m.content })),
     ...groqRounds(rounds),
   ];
 
+  const names = new Map();
+  const maxOut = ctx.remote ? 0 : GROQ_MAX_OUT;
+
   for (let i = 0; i < steps; i++) {
-    let { r, j } = await groqPost(apiKey, groqBody(messages, tools));
+    const last = !ctx.remote && steps > 1 && i === steps - 1;
+    const aged = ctx.remote ? messages : ageToolResults(messages, names);
+    const wire = last ? [...aged, { role: "user", content: FINAL_NUDGE }] : aged;
+    const wireTools = last ? [] : tools;
+
+    let { r, j } = await groqPost(apiKey, groqBody(wire, wireTools, maxOut));
 
     if (toolFailed(r, j)) {
       console.log("groq tool_use_failed, retrying with tools");
-      ({ r, j } = await groqPost(apiKey, groqBody(messages, tools)));
+      ({ r, j } = await groqPost(apiKey, groqBody(wire, wireTools, maxOut)));
     }
 
     if (toolFailed(r, j)) {
       console.log("groq tool_use_failed again, asking for a final answer without tools");
-      const wrapped = [...messages, { role: "user", content: FINAL_NUDGE }];
-      ({ r, j } = await groqPost(apiKey, groqBody(wrapped, [])));
+      const wrapped = last ? wire : [...wire, { role: "user", content: FINAL_NUDGE }];
+      ({ r, j } = await groqPost(apiKey, groqBody(wrapped, [], maxOut)));
     }
 
     if (toolFailed(r, j)) {
       console.log("groq still failed, returning the sources found");
+      return fallbackReply(ctx);
+    }
+
+    if (r.status === 429 && (ctx.sources.length || ctx.searched.length)) {
+      console.log("groq still rate limited, returning the sources found");
       return fallbackReply(ctx);
     }
 
@@ -463,6 +526,7 @@ async function callGroq({ apiKey, system, history, ctx, tools, steps, rounds }) 
     }
 
     messages.push({ role: "assistant", content: msg.content || "", tool_calls: msg.tool_calls });
+    for (const call of msg.tool_calls) names.set(call.id, call.function.name);
 
     for (const call of msg.tool_calls) {
       const args = parseArgs(call.function.arguments);
