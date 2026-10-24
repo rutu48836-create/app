@@ -5,12 +5,22 @@ const UA = "Mozilla/5.0 (compatible; LunaarBot/1.0)";
 const MAX_HTML = 2_000_000;
 const MAX_TEXT = Number(process.env.READ_URL_MAX_CHARS) || 5000;
 const MAX_LINKS = 12;
+const EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
+const PHONE_RE = /(?:\+91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}/g;
 
 function cut(text, max) {
   if (text.length <= max) return { text, truncated: false };
   const slice = text.slice(0, max);
   const lastSpace = slice.lastIndexOf(" ");
   return { text: (lastSpace > max * 0.8 ? slice.slice(0, lastSpace) : slice).trim(), truncated: true };
+}
+
+function mailtoOf(a) {
+  try {
+    return decodeURIComponent(a.getAttribute("href").slice(7).split("?")[0]).trim().toLowerCase();
+  } catch {
+    return "";
+  }
 }
 
 export async function readUrl(url) {
@@ -48,16 +58,21 @@ export async function readUrl(url) {
     if (links.length >= MAX_LINKS) break;
   }
 
-  const article = new Readability(doc.cloneNode(true)).parse();
+  const bodyText = (doc.body?.textContent || "").replace(/\s+/g, " ").trim();
+  const mailtos = [...doc.querySelectorAll('a[href^="mailto:"]')].map(mailtoOf).filter(Boolean);
 
-  const full = (article?.textContent || doc.body?.textContent || "")
-    .replace(/\s+/g, " ")
-    .trim();
+  const emails = [...new Set([...(bodyText.match(EMAIL_RE) || []).map((e) => e.toLowerCase()), ...mailtos])]
+    .filter((e) => !/\.(png|jpe?g|gif|svg|webp)$/i.test(e))
+    .slice(0, 5);
+  const phones = [...new Set((bodyText.match(PHONE_RE) || []).map((n) => n.trim()))].slice(0, 3);
+
+  const article = new Readability(doc.cloneNode(true)).parse();
+  const full = (article?.textContent || bodyText).replace(/\s+/g, " ").trim();
 
   const { text, truncated } = cut(full, MAX_TEXT);
   const title = article?.title || doc.title || "";
 
   dom.window.close();
 
-  return { url: r.url, title, text, truncated, links };
+  return { url: r.url, title, text, truncated, emails, phones, links };
 }
