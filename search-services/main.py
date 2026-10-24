@@ -1,5 +1,5 @@
-
 import hmac
+import logging
 import os
 import threading
 import time
@@ -7,6 +7,9 @@ import time
 from ddgs import DDGS
 from ddgs.exceptions import DDGSException, RatelimitException
 from fastapi import FastAPI, Header, HTTPException, Query
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("search")
 
 SECRET = os.environ.get("SEARCH_SERVICE_SECRET", "")
 BACKEND = os.environ.get("DDGS_BACKEND", "auto")
@@ -40,6 +43,20 @@ def register_failure():
 
 @app.get("/health")
 def health():
+    return {
+        "ok": True,
+        "backend": BACKEND,
+        "fails": state["fails"],
+        "blocked_for": max(0, round(state["blocked_until"] - time.time())),
+    }
+
+
+@app.post("/reset")
+def reset(x_service_key: str = Header(default="")):
+    check_key(x_service_key)
+    state["blocked_until"] = 0.0
+    state["fails"] = 0
+    cache.clear()
     return {"ok": True}
 
 
@@ -73,18 +90,21 @@ def search(
         try:
             raw = DDGS(timeout=10).text(query, max_results=limit, backend=BACKEND)
             state["fails"] = 0
-        except RatelimitException:
+        except RatelimitException as e:
+            log.error("rate limited: %r", e)
             trip(BREAKER_SECONDS)
             raise HTTPException(status_code=503, detail="The search engines rate limited the request")
         except DDGSException as e:
             if "no results" in str(e).lower():
                 raw = []
             else:
+                log.exception("ddgs failed backend=%s query=%r", BACKEND, query)
                 register_failure()
-                raise HTTPException(status_code=502, detail=str(e)[:200])
+                raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {str(e)[:200]}")
         except Exception as e:
+            log.exception("unexpected failure backend=%s query=%r", BACKEND, query)
             register_failure()
-            raise HTTPException(status_code=502, detail=str(e)[:200])
+            raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {str(e)[:200]}")
         finally:
             state["last"] = time.time()
 
